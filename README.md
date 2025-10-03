@@ -1,45 +1,256 @@
-원클릭 회전/감속/정지: 정중앙 슬롯(22번)에 표시되는 머리 1개가 빠르게 돌아가며, 감속 시엔 피치가 낮아지는 효과음과 함께 부드럽게 멈춥니다.
+package com.example.teampick;
 
-경제 연동: 회전 비용은 리더별로 누적 증가(64 → 128 → 192 …). 다이아몬드와 다이아몬드 블록(= 9개 환산) 모두 결제 가능합니다. 필요량 초과로 블록을 사용한 경우 거스름돈을 다이아로 환불합니다.
+import net.kyori.adventure.text.Component;
+import net.kyori.adventure.text.format.NamedTextColor;
+import net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer;
+import org.bukkit.*;
+import org.bukkit.enchantments.Enchantment;
+import org.bukkit.entity.Player;
+import org.bukkit.event.EventHandler;
+import org.bukkit.event.Listener;
+import org.bukkit.event.inventory.InventoryClickEvent;
+import org.bukkit.event.player.PlayerJoinEvent;
+import org.bukkit.inventory.Inventory;
+import org.bukkit.inventory.ItemFlag;
+import org.bukkit.inventory.ItemStack;
+import org.bukkit.inventory.meta.ItemMeta;
+import org.bukkit.inventory.meta.SkullMeta;
+import org.bukkit.scheduler.BukkitRunnable;
 
-중복 방지/필터링: 리더 자신, 이미 당첨된 인원, 이미 팀에 배정된 인원은 후보에서 자동 제외됩니다. 당첨자는 즉시 후보풀에서 제거되어 같은 세션에서 재추첨되지 않습니다.
+import java.util.*;
 
-영구 저장: 리더 UUID, 팀 편성, 후보풀(spin.candidates), 이미 당첨(spin.alreadyWon), 최대 팀원 수 등을 data.yml에 저장합니다. 당첨 직후, 리더 지정 직후, 주기적 자동 저장, 서버 종료 시 저장됩니다.
+public class UIPicker implements Listener {
 
-안전한 동작: 서버 성능을 고려한 1틱 고정 루프 + 가변 갱신주기으로 감속 구현. UI는 인벤토리 형태라 충돌 위험이 낮습니다.
+    public static final String UI_TITLE = "팀 뽑기 (좌클릭: 회전/정지)";
+    // 비용이 들도록 바뀌었으므로 라벨 수정: 배정 없음만 강조
+    public static final String UI_TITLE_TEST = "테스트 팀 뽑기 (배정 없음)";
+    private static final int CENTER_SLOT = 22;
 
-명령어 안내 (한국어 표기 기준)
-운영자(OP) 전용
+    private final Main plugin;
+    private final DataStore dataStore;
+    private final LeaderManager leaderManager;
+    private final SpinService spinService;
+    private final TeamService teamService;
 
-/setleader <플레이어>
-지정한 플레이어를 리더로 임명합니다. 임명 즉시 저장되며, 리더는 팀 뽑기 회전을 시작/정지할 권한을 갖습니다.
+    private final Map<UUID, SpinTask> running = new HashMap<>();
 
-/setmaxmembers <숫자>
-팀 최대 인원 수를 변경합니다. 기본값은 3명이며, 필요 시 2명~대규모까지 확장 가능합니다.
+    public UIPicker(Main plugin, DataStore ds, LeaderManager lm, SpinService ss, TeamService ts) {
+        this.plugin = plugin; this.dataStore = ds; this.leaderManager = lm; this.spinService = ss; this.teamService = ts;
+    }
 
-/namecolor <플레이어> <색상>
-플레이어의 이름표 색을 설정합니다. 색상은 Minecraft 기본 색상(예: red, blue, gold, green, aqua, yellow, white, gray 등)을 넉넉히 지원하도록 구현되어 있습니다.
+    public void openFor(Player viewer) {
+        Inventory inv = Bukkit.createInventory(viewer, 54, Component.text(UI_TITLE));
+        inv.clear();
+        inv.setItem(CENTER_SLOT, placeholder("클릭해서 회전 시작", NamedTextColor.GRAY));
+        viewer.openInventory(inv);
+    }
 
-/gamestart
-게임 시작 처리입니다. 시작 시 월드보더 내부에서만 랜덤 TP가 가능하도록 제어합니다(게임 환경 세팅에 활용).
+    public void openForTest(Player viewer) {
+        Inventory inv = Bukkit.createInventory(viewer, 54, Component.text(UI_TITLE_TEST));
+        inv.clear();
+        inv.setItem(CENTER_SLOT, placeholder("클릭해서 회전 시작(테스트/비용 소모)", NamedTextColor.AQUA));
+        viewer.openInventory(inv);
+    }
 
-/teamleave <플레이어>
-해당 플레이어를 현재 소속 팀에서 탈퇴시킵니다(운영 편의를 위한 강제 탈퇴).
+    private ItemStack placeholder(String text, NamedTextColor color) {
+        ItemStack paper = new ItemStack(Material.PAPER);
+        ItemMeta m = paper.getItemMeta();
+        m.displayName(Component.text(text, color));
+        paper.setItemMeta(m); return paper;
+    }
 
-/isleader
-현재 등록된 리더 정보를 확인합니다(운영 점검용).
+    private ItemStack makeHead(UUID uuid, String spinPrefix, boolean glow) {
+        ItemStack head = new ItemStack(Material.PLAYER_HEAD);
+        SkullMeta meta = (SkullMeta) head.getItemMeta();
 
-/testteampick
-테스트용 팀 뽑기 UI를 엽니다. 실제 배정은 하지 않되, 비용은 동일하게 소모되도록 되어 있습니다. 테스트에는 스티브 머리가 후보로 포함됩니다.
+        String base;
+        if (uuid == null) base = "Steve";
+        else {
+            OfflinePlayer off = Bukkit.getOfflinePlayer(uuid);
+            base = (off.getName() == null) ? uuid.toString() : off.getName();
+            meta.setOwningPlayer(off);
+        }
 
-리더/일반 유저
+        String name = (spinPrefix == null ? "" : (spinPrefix + " ")) + base;
+        meta.displayName(Component.text(name, NamedTextColor.AQUA));
+        meta.lore(List.of(Component.text("좌클릭: 회전/정지", NamedTextColor.GRAY)));
+        if (glow) { meta.addEnchant(Enchantment.UNBREAKING, 1, true); meta.addItemFlags(ItemFlag.HIDE_ENCHANTS); }
 
-/teampick
-팀 뽑기 UI를 엽니다. 리더만 중앙 머리를 클릭하여 회전을 시작/정지할 수 있습니다.
+        head.setItemMeta(meta);
+        return head;
+    }
 
-첫 클릭: 비용 결제 후 회전 시작
+    @EventHandler
+    public void onClick(InventoryClickEvent e) {
+        if (!(e.getWhoClicked() instanceof Player p)) return;
 
-두 번째 클릭: 감속 시작 → 부드럽게 정지 → 당첨 처리 (일반 모드에서만 팀 배정/TP/저장)
+        String title = PlainTextComponentSerializer.plainText().serialize(e.getView().title());
+        boolean testMode;
+        if (UI_TITLE_TEST.equals(title)) testMode = true;
+        else if (UI_TITLE.equals(title)) testMode = false;
+        else return;
 
-권한 노드 예시
-teampick.admin : 상기 운영자 명령어 전체 허용 (PermissionsEx/LuckPerms 등과 함께 사용 권장)
+        e.setCancelled(true);
+        if (!leaderManager.isLeader(p)) {
+            p.sendMessage(Component.text("리더만 회전을 시작/정지할 수 있어요.", NamedTextColor.RED));
+            return;
+        }
+        if (e.getSlot() != CENTER_SLOT) return;
+
+        UUID leaderId = p.getUniqueId();
+        SpinTask task = running.get(leaderId);
+
+        if (task == null) {
+            // ★ 테스트 모드도 동일하게 비용 소모
+            int cost = spinService.getCurrentCost(p);
+            if (!spinService.hasEnoughDiamonds(p)) {
+                p.sendMessage(Component.text("다이아가 부족해요! (필요: " + cost + "개)", NamedTextColor.RED));
+                p.playSound(p.getLocation(), Sound.ENTITY_VILLAGER_NO, 1f, 1f);
+                return;
+            }
+            if (!spinService.payDiamonds(p)) {
+                p.sendMessage(Component.text("다이아 지불에 실패했어요.", NamedTextColor.RED));
+                return;
+            }
+            p.updateInventory();
+            p.sendMessage(Component.text(
+                    (testMode ? "[테스트] " : "") + "다이아 " + cost + "개 소모. (다음 비용: " + (cost + 64) + "개)",
+                    NamedTextColor.GRAY));
+
+            // 후보 수집: 테스트는 스티브 포함, 일반은 필터링
+            List<UUID> pool = testMode
+                    ? spinService.getAllCandidatesForTest()
+                    : spinService.getFilteredCandidatesForNormal();
+            if (testMode) { pool = new ArrayList<>(pool); pool.add(null); }
+
+            if (pool.size() < 2) {
+                p.sendMessage(Component.text("후보가 2명 이상일 때 회전합니다.", NamedTextColor.RED));
+                return;
+            }
+
+            task = new SpinTask(p, e.getInventory(), pool, testMode);
+            running.put(leaderId, task);
+            task.start();
+            p.sendMessage(Component.text("회전을 시작했습니다. 다시 좌클릭하면 감속/정지합니다.", NamedTextColor.AQUA));
+        } else {
+            task.requestStop();
+            p.sendMessage(Component.text("감속 중... (효과음과 함께 천천히 멈춰요)", NamedTextColor.YELLOW));
+        }
+    }
+
+    @EventHandler
+    public void onJoin(PlayerJoinEvent e) { spinService.ensureCandidate(e.getPlayer()); }
+
+    /** 중앙 한 칸 회전 + 부드러운 감속 */
+    private class SpinTask extends BukkitRunnable {
+        private final Player leader;
+        private final Inventory inv;
+        private final boolean testMode;
+        private final List<UUID> seq;
+
+        private final String[] SPINNER = {"⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"};
+        private int spinFrame = 0;
+
+        private boolean stopping = false;
+        private int idx = 0;
+        private int tickCounter = 0;
+
+        private int stepDelay = 2;        // 시작 속도(틱)
+        private final int maxDelay = 12;  // 완전 정지 직전
+        private int stepsSinceStop = 0;
+
+        private double pitch = 1.8;
+        private final double minPitch = 0.6;
+
+        SpinTask(Player leader, Inventory inv, List<UUID> candidates, boolean testMode) {
+            this.leader = leader; this.inv = inv; this.testMode = testMode;
+            this.seq = new ArrayList<>(candidates);
+        }
+
+        void start() { runTaskTimer(plugin, 0L, 1L); } // 1틱 고정
+        void requestStop() { stopping = true; }
+
+        @Override
+        public void run() {
+            if (!leaderManager.isLeader(leader)) { finalizeSpin(null); return; }
+            if (seq.isEmpty()) { finalizeSpin(null); return; }
+
+            tickCounter++;
+            if (tickCounter % stepDelay != 0) return;
+
+            UUID cur = seq.get(idx);
+            idx = (idx + 1) % seq.size();
+
+            String prefix = SPINNER[spinFrame];
+            spinFrame = (spinFrame + 1) % SPINNER.length;
+            inv.setItem(CENTER_SLOT, makeHead(cur, prefix, true));
+
+            if (!stopping) {
+                leader.playSound(leader.getLocation(), Sound.UI_BUTTON_CLICK, 0.5f, (float) pitch);
+            } else {
+                pitch = Math.max(minPitch, pitch - 0.07);
+                leader.playSound(leader.getLocation(), Sound.BLOCK_NOTE_BLOCK_HAT, 0.9f, (float) pitch);
+                stepsSinceStop++;
+                if (stepsSinceStop % 2 == 0 && stepDelay < maxDelay) stepDelay++;
+                if (stepDelay >= maxDelay && stepsSinceStop >= 6) {
+                    UUID winner = getUuidFromHead(inv.getItem(CENTER_SLOT));
+                    finalizeSpin(winner);
+                }
+            }
+        }
+
+        private void finalizeSpin(UUID winner) {
+            try { cancel(); } catch (Exception ignored) {}
+            running.remove(leader.getUniqueId());
+
+            if (testMode) {
+                // 테스트: 배정 없음(단, 비용은 이미 소모됨)
+                String who = (winner == null) ? "Steve"
+                        : (Bukkit.getOfflinePlayer(winner).getName() == null ? winner.toString()
+                        : Bukkit.getOfflinePlayer(winner).getName());
+                leader.sendMessage(Component.text("[테스트] 당첨(배정 없음): " + who, NamedTextColor.AQUA));
+                leader.playSound(leader.getLocation(), Sound.UI_TOAST_CHALLENGE_COMPLETE, 1f, 1f);
+                inv.setItem(CENTER_SLOT, makeHead(winner, null, false));
+                return;
+            }
+
+            if (winner == null) {
+                leader.sendMessage(Component.text("유효한 플레이어가 아니라서 무효 처리되었습니다. 후보를 확인하세요.", NamedTextColor.RED));
+                inv.setItem(CENTER_SLOT, makeHead(null, null, false));
+                return;
+            }
+            if (spinService.alreadyWonBefore(winner) || teamService.isAlreadyAssigned(winner)) {
+                leader.sendMessage(Component.text("이미 당첨/배정된 플레이어라서 건너뛰었어요.", NamedTextColor.YELLOW));
+                return;
+            }
+
+            spinService.markWinner(winner);
+            teamService.assignToLeaderTeam(winner, leaderManager);
+            spinService.removeCandidate(winner); // 일반 모드: 당첨자는 후보 제외
+
+            Location to = leader.getLocation().clone().add(1, 0, 0);
+            Player online = Bukkit.getPlayer(winner);
+            if (online != null) {
+                online.teleportAsync(to);
+                online.sendMessage(Component.text("팀에 합류! 리더 옆으로 이동했습니다.", NamedTextColor.GOLD));
+            } else {
+                teamService.queueTeleportOnJoin(winner, to);
+            }
+
+            dataStore.saveAll(leaderManager, teamService, spinService);
+
+            inv.setItem(CENTER_SLOT, makeHead(winner, null, false));
+            String name = Bukkit.getOfflinePlayer(winner).getName();
+            leader.sendMessage(Component.text((name == null ? winner.toString() : name) + " 님 당첨! 팀 배정 완료.", NamedTextColor.GOLD));
+            leader.playSound(leader.getLocation(), Sound.UI_TOAST_CHALLENGE_COMPLETE, 1f, 1f);
+        }
+    }
+
+    private static UUID getUuidFromHead(ItemStack head) {
+        if (head == null || head.getType() != Material.PLAYER_HEAD) return null;
+        ItemMeta im = head.getItemMeta();
+        if (!(im instanceof SkullMeta sm)) return null;
+        OfflinePlayer op = sm.getOwningPlayer();
+        return (op != null) ? op.getUniqueId() : null;
+    }
+}
